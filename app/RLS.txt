@@ -1,0 +1,1142 @@
+-- ===============================
+-- 4대보험 취득상실 통합 관리 시스템 RLS 정책
+-- ===============================
+
+-- ===============================
+-- 1. RLS 활성화 및 기본 설정
+-- ===============================
+
+-- 모든 주요 테이블에 RLS 활성화
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE labor_offices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE labor_office_staff ENABLE ROW LEVEL SECURITY;
+ALTER TABLE companies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE departments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE monthly_payroll ENABLE ROW LEVEL SECURITY;
+ALTER TABLE worker_payroll_details ENABLE ROW LEVEL SECURITY;
+ALTER TABLE attendance_records ENABLE ROW LEVEL SECURITY;
+ALTER TABLE insurance_acquisitions_losses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE insurance_eligibility_records ENABLE ROW LEVEL SECURITY;
+ALTER TABLE current_insurance_status ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_company_assignments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_department_assignments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE client_services ENABLE ROW LEVEL SECURITY;
+ALTER TABLE report_schedules ENABLE ROW LEVEL SECURITY;
+
+-- ===============================
+-- 2. 헬퍼 함수들 생성
+-- ===============================
+
+-- 현재 사용자 ID 조회 함수
+CREATE OR REPLACE FUNCTION get_current_user_id()
+RETURNS INTEGER AS $$
+BEGIN
+    RETURN COALESCE(current_setting('app.current_user_id', true)::INTEGER, 0);
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 현재 사용자의 역할 확인 함수
+CREATE OR REPLACE FUNCTION user_has_role(role_code_param TEXT)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 
+        FROM user_roles ur
+        JOIN roles r ON ur.role_id = r.role_id
+        WHERE ur.user_id = get_current_user_id()
+          AND r.role_code = role_code_param
+          AND ur.is_active = true
+          AND (ur.end_date IS NULL OR ur.end_date >= CURRENT_DATE)
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 노무사 사무실 관리자/직원 여부 확인
+CREATE OR REPLACE FUNCTION is_labor_office_member()
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN user_has_role('LABOR_ADMIN') OR user_has_role('LABOR_STAFF');
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 회사 직원 여부 확인  
+CREATE OR REPLACE FUNCTION is_company_member()
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN user_has_role('COMPANY_ADMIN') OR user_has_role('COMPANY_HR');
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 현재 사용자의 소속 노무사 사무실 ID 조회
+CREATE OR REPLACE FUNCTION get_user_labor_office_id()
+RETURNS INTEGER AS $$
+BEGIN
+    RETURN (
+        SELECT los.labor_office_id
+        FROM labor_office_staff los
+        WHERE los.user_id = get_current_user_id()
+          AND los.employment_status = 'active'
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 현재 사용자의 소속 회사 ID 조회
+CREATE OR REPLACE FUNCTION get_user_company_id()
+RETURNS INTEGER AS $$
+BEGIN
+    RETURN (
+        SELECT d.company_id
+        FROM user_department_assignments uda
+        JOIN departments d ON uda.department_id = d.department_id
+        WHERE uda.user_id = get_current_user_id()
+          AND uda.is_active = true
+          AND (uda.end_date IS NULL OR uda.end_date >= CURRENT_DATE)
+        LIMIT 1
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 현재 사용자가 담당하는 회사들 확인
+CREATE OR REPLACE FUNCTION user_can_access_company(company_id_param INTEGER)
+RETURNS BOOLEAN AS $$
+BEGIN
+    -- 노무사 사무실 직원인 경우: 담당 회사 확인
+    IF is_labor_office_member() THEN
+        RETURN EXISTS (
+            SELECT 1 
+            FROM user_company_assignments uca
+            WHERE uca.user_id = get_current_user_id()
+              AND uca.company_id = company_id_param
+              AND uca.is_active = true
+              AND (uca.end_date IS NULL OR uca.end_date >= CURRENT_DATE)
+        );
+    END IF;
+    
+    -- 회사 직원인 경우: 자신의 회사만
+    IF is_company_member() THEN
+        RETURN get_user_company_id() = company_id_param;
+    END IF;
+    
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 현재 사용자가 특정 부서에 접근 가능한지 확인
+CREATE OR REPLACE FUNCTION user_can_access_department(department_id_param INTEGER)
+RETURNS BOOLEAN AS $$
+DECLARE
+    dept_company_id INTEGER;
+BEGIN
+    -- 부서의 회사 ID 조회
+    SELECT company_id INTO dept_company_id
+    FROM departments
+    WHERE department_id = department_id_param;
+    
+    -- 회사 접근 권한이 있으면 부서도 접근 가능
+    RETURN user_can_access_company(dept_company_id);
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ===============================
+-- 3. 사용자 관리 테이블 RLS 정책
+-- ===============================
+
+-- users 테이블: 자신의 정보만 조회 가능
+CREATE POLICY users_select_policy ON users
+    FOR SELECT USING (user_id = get_current_user_id());
+
+CREATE POLICY users_update_policy ON users
+    FOR UPDATE USING (user_id = get_current_user_id());
+
+-- ===============================
+-- 4. 노무사 사무실 관리 RLS 정책
+-- ===============================
+
+-- labor_offices: 소속 노무사 사무실만 조회
+CREATE POLICY labor_offices_policy ON labor_offices
+    FOR ALL USING (
+        labor_office_id = get_user_labor_office_id()
+    );
+
+-- labor_office_staff: 같은 노무사 사무실 직원들만 조회
+CREATE POLICY labor_office_staff_policy ON labor_office_staff
+    FOR ALL USING (
+        labor_office_id = get_user_labor_office_id()
+    );
+
+-- ===============================
+-- 5. 회사 관리 RLS 정책
+-- ===============================
+
+-- companies: 담당 회사만 접근
+CREATE POLICY companies_select_policy ON companies
+    FOR SELECT USING (user_can_access_company(company_id));
+
+CREATE POLICY companies_update_policy ON companies
+    FOR UPDATE USING (
+        user_can_access_company(company_id) AND user_has_role('LABOR_ADMIN')
+    );
+
+-- departments: 담당 회사의 부서만 접근
+CREATE POLICY departments_select_policy ON departments
+    FOR SELECT USING (user_can_access_company(company_id));
+
+CREATE POLICY departments_update_policy ON departments
+    FOR UPDATE USING (
+        user_can_access_company(company_id) AND 
+        (user_has_role('LABOR_ADMIN') OR user_has_role('COMPANY_ADMIN'))
+    );
+
+-- ===============================
+-- 6. 근로자 관리 RLS 정책
+-- ===============================
+
+-- workers: 담당 회사의 근로자만 접근
+CREATE POLICY workers_select_policy ON workers
+    FOR SELECT USING (user_can_access_company(company_id));
+
+CREATE POLICY workers_insert_policy ON workers
+    FOR INSERT WITH CHECK (
+        user_can_access_company(company_id) AND 
+        (user_has_role('LABOR_ADMIN') OR user_has_role('LABOR_STAFF') OR user_has_role('COMPANY_ADMIN'))
+    );
+
+CREATE POLICY workers_update_policy ON workers
+    FOR UPDATE USING (
+        user_can_access_company(company_id) AND 
+        (user_has_role('LABOR_ADMIN') OR user_has_role('LABOR_STAFF') OR user_has_role('COMPANY_ADMIN'))
+    );
+
+-- ===============================
+-- 7. 급여 관리 RLS 정책 (COMPANY_ADMIN 권한 확대)
+-- ===============================
+
+-- monthly_payroll: 급여 정보 - COMPANY_ADMIN에게 자사 모든 권한 부여
+DROP POLICY IF EXISTS monthly_payroll_select_policy ON monthly_payroll;
+DROP POLICY IF EXISTS monthly_payroll_insert_policy ON monthly_payroll;
+
+CREATE POLICY monthly_payroll_select_policy ON monthly_payroll
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = monthly_payroll.worker_id
+              AND user_can_access_company(w.company_id)
+              AND (
+                user_has_role('LABOR_ADMIN') OR 
+                user_has_role('LABOR_STAFF') OR
+                user_has_role('COMPANY_ADMIN') OR  -- 자사 모든 급여 조회 가능
+                (user_has_role('COMPANY_HR') AND w.worker_id = get_current_user_id()) -- 본인 급여만
+              )
+        )
+    );
+
+CREATE POLICY monthly_payroll_modify_policy ON monthly_payroll
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = monthly_payroll.worker_id
+              AND user_can_access_company(w.company_id)
+              AND (
+                user_has_role('LABOR_ADMIN') OR 
+                user_has_role('LABOR_STAFF') OR
+                user_has_role('COMPANY_ADMIN')  -- 자사 급여 수정 가능
+              )
+        )
+    );
+
+-- worker_payroll_details: 급여 상세 정보 - COMPANY_ADMIN에게 자사 모든 권한 부여
+DROP POLICY IF EXISTS worker_payroll_details_select_policy ON worker_payroll_details;
+DROP POLICY IF EXISTS worker_payroll_details_modify_policy ON worker_payroll_details;
+
+CREATE POLICY worker_payroll_details_select_policy ON worker_payroll_details
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = worker_payroll_details.worker_id
+              AND user_can_access_company(w.company_id)
+              AND (
+                user_has_role('LABOR_ADMIN') OR 
+                user_has_role('LABOR_STAFF') OR
+                user_has_role('COMPANY_ADMIN')  -- 자사 급여 상세 조회 가능
+              )
+        )
+    );
+
+CREATE POLICY worker_payroll_details_modify_policy ON worker_payroll_details
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = worker_payroll_details.worker_id
+              AND user_can_access_company(w.company_id)
+              AND (
+                user_has_role('LABOR_ADMIN') OR 
+                user_has_role('LABOR_STAFF') OR
+                user_has_role('COMPANY_ADMIN')  -- 자사 급여 상세 수정 가능
+              )
+        )
+    );
+
+-- income_tax_withholding: 원천징수영수증 - COMPANY_ADMIN에게 자사 모든 권한 부여
+ALTER TABLE income_tax_withholding ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY income_tax_withholding_select_policy ON income_tax_withholding
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = income_tax_withholding.worker_id
+              AND user_can_access_company(w.company_id)
+              AND (
+                user_has_role('LABOR_ADMIN') OR 
+                user_has_role('LABOR_STAFF') OR
+                user_has_role('COMPANY_ADMIN')  -- 자사 원천징수 조회 가능
+              )
+        )
+    );
+
+CREATE POLICY income_tax_withholding_modify_policy ON income_tax_withholding
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = income_tax_withholding.worker_id
+              AND user_can_access_company(w.company_id)
+              AND (
+                user_has_role('LABOR_ADMIN') OR 
+                user_has_role('LABOR_STAFF') OR
+                user_has_role('COMPANY_ADMIN')  -- 자사 원천징수 수정 가능
+              )
+        )
+    );
+
+-- ===============================
+-- 9. 4대보험 관리 RLS 정책 (COMPANY_ADMIN 권한 확대)
+-- ===============================
+
+-- insurance_acquisitions_losses: 4대보험 취득상실 신고 - COMPANY_ADMIN에게 자사 모든 권한 부여
+DROP POLICY IF EXISTS insurance_acquisitions_losses_policy ON insurance_acquisitions_losses;
+
+CREATE POLICY insurance_acquisitions_losses_select_policy ON insurance_acquisitions_losses
+    FOR SELECT USING (user_can_access_company(company_id));
+
+CREATE POLICY insurance_acquisitions_losses_modify_policy ON insurance_acquisitions_losses
+    FOR ALL USING (
+        user_can_access_company(company_id) AND (
+            user_has_role('LABOR_ADMIN') OR 
+            user_has_role('LABOR_STAFF') OR
+            user_has_role('COMPANY_ADMIN')  -- 자사 4대보험 신고 처리 가능
+        )
+    );
+
+-- insurance_eligibility_records: 4대보험 가입 판정 기록 - COMPANY_ADMIN에게 자사 모든 권한 부여
+DROP POLICY IF EXISTS insurance_eligibility_records_policy ON insurance_eligibility_records;
+
+CREATE POLICY insurance_eligibility_records_select_policy ON insurance_eligibility_records
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = insurance_eligibility_records.worker_id
+              AND user_can_access_company(w.company_id)
+        )
+    );
+
+CREATE POLICY insurance_eligibility_records_modify_policy ON insurance_eligibility_records
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = insurance_eligibility_records.worker_id
+              AND user_can_access_company(w.company_id)
+              AND (
+                user_has_role('LABOR_ADMIN') OR 
+                user_has_role('LABOR_STAFF') OR
+                user_has_role('COMPANY_ADMIN')  -- 자사 가입 판정 처리 가능
+              )
+        )
+    );
+
+-- current_insurance_status: 현재 4대보험 가입 상태 - COMPANY_ADMIN에게 자사 모든 권한 부여
+DROP POLICY IF EXISTS current_insurance_status_policy ON current_insurance_status;
+
+CREATE POLICY current_insurance_status_select_policy ON current_insurance_status
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = current_insurance_status.worker_id
+              AND user_can_access_company(w.company_id)
+        )
+    );
+
+CREATE POLICY current_insurance_status_modify_policy ON current_insurance_status
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = current_insurance_status.worker_id
+              AND user_can_access_company(w.company_id)
+              AND (
+                user_has_role('LABOR_ADMIN') OR 
+                user_has_role('LABOR_STAFF') OR
+                user_has_role('COMPANY_ADMIN')  -- 자사 가입 상태 관리 가능
+              )
+        )
+    );
+
+-- ===============================
+-- 추가: 기타 관련 테이블들도 COMPANY_ADMIN 권한 확대
+-- ===============================
+
+-- daily_worker_continuous_periods: 일용직 연속 근무 기간 - COMPANY_ADMIN 권한 추가
+ALTER TABLE daily_worker_continuous_periods ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY daily_worker_continuous_periods_select_policy ON daily_worker_continuous_periods
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = daily_worker_continuous_periods.worker_id
+              AND user_can_access_company(w.company_id)
+        )
+    );
+
+CREATE POLICY daily_worker_continuous_periods_modify_policy ON daily_worker_continuous_periods
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = daily_worker_continuous_periods.worker_id
+              AND user_can_access_company(w.company_id)
+              AND (
+                user_has_role('LABOR_ADMIN') OR 
+                user_has_role('LABOR_STAFF') OR
+                user_has_role('COMPANY_ADMIN')  -- 자사 연속 근무 관리 가능
+              )
+        )
+    );
+
+-- worker_voluntary_insurance: 선택가입 신청 - COMPANY_ADMIN 권한 추가
+ALTER TABLE worker_voluntary_insurance ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY worker_voluntary_insurance_select_policy ON worker_voluntary_insurance
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = worker_voluntary_insurance.worker_id
+              AND user_can_access_company(w.company_id)
+        )
+    );
+
+CREATE POLICY worker_voluntary_insurance_modify_policy ON worker_voluntary_insurance
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = worker_voluntary_insurance.worker_id
+              AND user_can_access_company(w.company_id)
+              AND (
+                user_has_role('LABOR_ADMIN') OR 
+                user_has_role('LABOR_STAFF') OR
+                user_has_role('COMPANY_ADMIN')  -- 자사 선택가입 승인 가능
+              )
+        )
+    );
+
+-- attendance_records: 근태 기록 수정 정책 업데이트
+DROP POLICY IF EXISTS attendance_records_insert_policy ON attendance_records;
+
+CREATE POLICY attendance_records_modify_policy ON attendance_records
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = attendance_records.worker_id
+              AND user_can_access_company(w.company_id)
+              AND (
+                user_has_role('LABOR_ADMIN') OR 
+                user_has_role('LABOR_STAFF') OR
+                user_has_role('COMPANY_ADMIN') OR  -- 자사 근태 모든 권한
+                user_has_role('COMPANY_HR')
+              )
+        )
+    );
+
+-- ===============================
+-- 8. 근태 관리 RLS 정책
+-- ===============================
+
+-- attendance_records: 근태 기록
+CREATE POLICY attendance_records_select_policy ON attendance_records
+    FOR SELECT USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = attendance_records.worker_id
+              AND user_can_access_company(w.company_id)
+        )
+    );
+
+CREATE POLICY attendance_records_insert_policy ON attendance_records
+    FOR INSERT WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = attendance_records.worker_id
+              AND user_can_access_company(w.company_id)
+              AND (
+                user_has_role('LABOR_ADMIN') OR 
+                user_has_role('LABOR_STAFF') OR
+                user_has_role('COMPANY_ADMIN') OR
+                user_has_role('COMPANY_HR')
+              )
+        )
+    );
+
+-- ===============================
+-- 9. 4대보험 관리 RLS 정책
+-- ===============================
+
+-- insurance_acquisitions_losses: 4대보험 취득상실 신고
+CREATE POLICY insurance_acquisitions_losses_policy ON insurance_acquisitions_losses
+    FOR ALL USING (user_can_access_company(company_id));
+
+-- insurance_eligibility_records: 4대보험 가입 판정 기록
+CREATE POLICY insurance_eligibility_records_policy ON insurance_eligibility_records
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = insurance_eligibility_records.worker_id
+              AND user_can_access_company(w.company_id)
+        )
+    );
+
+-- current_insurance_status: 현재 4대보험 가입 상태
+CREATE POLICY current_insurance_status_policy ON current_insurance_status
+    FOR ALL USING (
+        EXISTS (
+            SELECT 1 FROM workers w 
+            WHERE w.worker_id = current_insurance_status.worker_id
+              AND user_can_access_company(w.company_id)
+        )
+    );
+
+-- ===============================
+-- 10. 담당 관리 RLS 정책
+-- ===============================
+
+-- user_company_assignments: 담당 회사 배정
+CREATE POLICY user_company_assignments_select_policy ON user_company_assignments
+    FOR SELECT USING (
+        user_id = get_current_user_id() OR 
+        (user_has_role('LABOR_ADMIN') AND 
+         EXISTS (SELECT 1 FROM labor_office_staff WHERE user_id = user_company_assignments.user_id AND labor_office_id = get_user_labor_office_id()))
+    );
+
+-- user_department_assignments: 담당 부서 배정
+CREATE POLICY user_department_assignments_select_policy ON user_department_assignments
+    FOR SELECT USING (
+        user_id = get_current_user_id() OR 
+        user_can_access_department(department_id)
+    );
+
+-- ===============================
+-- 11. 서비스 관리 RLS 정책
+-- ===============================
+
+-- client_services: 클라이언트 서비스 현황
+CREATE POLICY client_services_policy ON client_services
+    FOR ALL USING (user_can_access_company(company_id));
+
+-- report_schedules: 신고 일정 관리
+CREATE POLICY report_schedules_policy ON report_schedules
+    FOR ALL USING (user_can_access_company(company_id));
+
+-- ===============================
+-- 12. 관리자 우회 정책 (시스템 관리용)
+-- ===============================
+
+-- 시스템 관리자 역할 확인 함수
+CREATE OR REPLACE FUNCTION is_system_admin()
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN user_has_role('SYSTEM_ADMIN');
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 시스템 관리자용 우회 정책들 (모든 테이블에 적용)
+CREATE POLICY admin_bypass_policy_users ON users
+    FOR ALL USING (is_system_admin());
+
+CREATE POLICY admin_bypass_policy_companies ON companies
+    FOR ALL USING (is_system_admin());
+
+CREATE POLICY admin_bypass_policy_workers ON workers
+    FOR ALL USING (is_system_admin());
+
+-- (다른 주요 테이블들에도 동일하게 적용 가능)
+
+-- ===============================
+-- 13. RLS 정책 확인 및 테스트 함수
+-- ===============================
+
+-- 현재 사용자의 권한 정보 조회 함수
+-- 수정된 함수 적용
+
+CREATE OR REPLACE FUNCTION get_current_user_permissions()
+RETURNS TABLE (
+    user_id INTEGER,
+    username TEXT,
+    roles TEXT[],
+    labor_office_id INTEGER,
+    company_id INTEGER,
+    accessible_companies INTEGER[]
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        u.user_id,
+        u.username::TEXT,  -- VARCHAR(50) -> TEXT 캐스팅
+        ARRAY(
+            SELECT r.role_code::TEXT  -- VARCHAR(30) -> TEXT 캐스팅
+            FROM user_roles ur 
+            JOIN roles r ON ur.role_id = r.role_id 
+            WHERE ur.user_id = get_current_user_id() 
+              AND ur.is_active = true
+        ) as roles,
+        get_user_labor_office_id() as labor_office_id,
+        get_user_company_id() as company_id,
+        ARRAY(
+            SELECT uca.company_id 
+            FROM user_company_assignments uca 
+            WHERE uca.user_id = get_current_user_id() 
+              AND uca.is_active = true
+        ) as accessible_companies
+    FROM users u
+    WHERE u.user_id = get_current_user_id();
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+-- ===============================
+-- 14. 사용자 세션 설정 헬퍼 함수
+-- ===============================
+
+-- 애플리케이션에서 사용자 로그인 시 호출할 함수
+CREATE OR REPLACE FUNCTION public.set_current_user_context(p_user_id bigint)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+AS $function$
+DECLARE
+    v_role_category text;
+BEGIN
+    -- 현재 사용자 ID 설정
+    PERFORM set_config('app.current_user_id', p_user_id::text, FALSE);
+
+    -- 사용자의 가장 높은 권한의 role_category 조회 (예: 'system' -> 'labor_office' -> 'company' 순)
+    -- 'SUPER_ADMIN' role_code에 해당하는 'system' role_category를 우선적으로 찾도록 합니다.
+    SELECT r.role_category
+    INTO v_role_category
+    FROM public.user_roles ur
+    JOIN public.roles r ON ur.role_id = r.role_id
+    WHERE ur.user_id = p_user_id
+      AND ur.is_active = true
+      AND (ur.end_date IS NULL OR ur.end_date >= CURRENT_DATE)
+    ORDER BY
+        CASE r.role_category
+            WHEN 'system' THEN 1
+            WHEN 'labor_office' THEN 2
+            WHEN 'company' THEN 3
+            ELSE 99
+        END
+    LIMIT 1;
+
+    -- role_category 설정
+    PERFORM set_config('app.user_role_category', COALESCE(v_role_category, 'unknown'), FALSE);
+
+    RAISE LOG 'User context set: user_id=%, role_category=%', p_user_id, COALESCE(v_role_category, 'unknown');
+END;
+$function$;
+--$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 로그아웃 시 컨텍스트 정리
+CREATE OR REPLACE FUNCTION clear_user_context()
+RETURNS VOID AS $$
+BEGIN
+    PERFORM set_config('app.current_user_id', '', false);
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ===============================
+-- 15. 정책 요약 및 코멘트
+-- ===============================
+
+COMMENT ON FUNCTION get_current_user_id() IS '현재 로그인한 사용자 ID 조회 (세션 변수 기반)';
+COMMENT ON FUNCTION user_has_role(TEXT) IS '현재 사용자가 특정 역할을 가지고 있는지 확인';
+COMMENT ON FUNCTION user_can_access_company(INTEGER) IS '현재 사용자가 특정 회사에 접근 가능한지 확인';
+COMMENT ON FUNCTION set_current_user_context(INTEGER) IS '사용자 로그인 시 컨텍스트 설정 (애플리케이션에서 호출)';
+
+
+-- ===============================
+-- SUPER_ADMIN 개발자용 최고 권한 설정
+-- 모든 테이블과 데이터에 대한 완전한 접근 권한
+-- ===============================
+
+-- ===============================
+-- 0. roles 테이블 제약조건 수정 (system 카테고리 추가)
+-- ===============================
+
+-- 기존 CHECK 제약조건 삭제 후 새로운 제약조건 추가
+ALTER TABLE roles DROP CONSTRAINT IF EXISTS roles_role_category_check;
+ALTER TABLE roles ADD CONSTRAINT roles_role_category_check 
+    CHECK (role_category IN ('company', 'labor_office', 'system'));
+
+-- ===============================
+-- 1. 모든 기본 역할 추가
+-- ===============================
+
+-- 시스템 관리 역할
+INSERT INTO roles (role_code, role_name, role_category, permissions, is_active) VALUES 
+('SUPER_ADMIN', '시스템 최고 관리자', 'system', '{
+    "description": "개발자 및 시스템 관리자용 최고 권한",
+    "access_level": "unlimited",
+    "can_bypass_rls": true,
+    "can_modify_system": true,
+    "can_access_all_data": true,
+    "security_clearance": "maximum"
+}', TRUE)
+ON CONFLICT (role_code) DO UPDATE SET
+    role_name = EXCLUDED.role_name,
+    role_category = EXCLUDED.role_category,
+    permissions = EXCLUDED.permissions,
+    is_active = TRUE;
+
+-- 노무사 사무실 역할들
+INSERT INTO roles (role_code, role_name, role_category, permissions, is_active) VALUES 
+('LABOR_ADMIN', '노무사 사무실 관리자', 'labor_office', '{
+    "description": "노무사 사무실 대표, 모든 담당 회사 관리",
+    "access_level": "labor_office_full",
+    "can_manage_staff": true,
+    "can_manage_clients": true,
+    "can_access_sensitive_data": true
+}', TRUE)
+ON CONFLICT (role_code) DO UPDATE SET
+    role_name = EXCLUDED.role_name,
+    role_category = EXCLUDED.role_category,
+    permissions = EXCLUDED.permissions,
+    is_active = TRUE;
+
+INSERT INTO roles (role_code, role_name, role_category, permissions, is_active) VALUES 
+('LABOR_STAFF', '노무사 사무실 직원', 'labor_office', '{
+    "description": "노무사 사무실 선임사무원/사무원",
+    "access_level": "labor_office_staff",
+    "can_process_insurance": true,
+    "can_access_payroll": true,
+    "can_manage_attendance": true
+}', TRUE)
+ON CONFLICT (role_code) DO UPDATE SET
+    role_name = EXCLUDED.role_name,
+    role_category = EXCLUDED.role_category,
+    permissions = EXCLUDED.permissions,
+    is_active = TRUE;
+
+-- 회사 역할들
+INSERT INTO roles (role_code, role_name, role_category, permissions, is_active) VALUES 
+('COMPANY_ADMIN', '회사 관리자', 'company', '{
+    "description": "회사 인사부장/대표이사, 자사 모든 권한",
+    "access_level": "company_full",
+    "can_manage_employees": true,
+    "can_access_payroll": true,
+    "can_manage_insurance": true,
+    "can_access_sensitive_data": true
+}', TRUE)
+ON CONFLICT (role_code) DO UPDATE SET
+    role_name = EXCLUDED.role_name,
+    role_category = EXCLUDED.role_category,
+    permissions = EXCLUDED.permissions,
+    is_active = TRUE;
+
+INSERT INTO roles (role_code, role_name, role_category, permissions, is_active) VALUES 
+('COMPANY_HR', '인사담당자', 'company', '{
+    "description": "회사 인사팀원/부서장",
+    "access_level": "company_hr",
+    "can_manage_attendance": true,
+    "can_view_basic_info": true,
+    "can_access_own_payroll": true
+}', TRUE)
+ON CONFLICT (role_code) DO UPDATE SET
+    role_name = EXCLUDED.role_name,
+    role_category = EXCLUDED.role_category,
+    permissions = EXCLUDED.permissions,
+    is_active = TRUE;
+
+-- ===============================
+-- 2. SUPER_ADMIN 확인 헬퍼 함수 업데이트
+-- ===============================
+
+-- 기존 시스템 관리자 확인 함수 업데이트
+CREATE OR REPLACE FUNCTION is_super_admin()
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN user_has_role('SUPER_ADMIN');
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 호환성을 위한 별칭 함수
+CREATE OR REPLACE FUNCTION is_system_admin()
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN is_super_admin();
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ===============================
+-- 3. 모든 테이블에 SUPER_ADMIN 우회 정책 적용
+-- ===============================
+
+-- 사용자 관리 테이블들
+CREATE POLICY super_admin_bypass_users ON users
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_roles ON roles
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_user_roles ON user_roles
+    FOR ALL USING (is_super_admin());
+
+-- 노무사 사무실 관리 테이블들
+CREATE POLICY super_admin_bypass_labor_offices ON labor_offices
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_labor_office_staff ON labor_office_staff
+    FOR ALL USING (is_super_admin());
+
+-- 회사 및 조직 관리 테이블들
+CREATE POLICY super_admin_bypass_companies ON companies
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_departments ON departments
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_workers ON workers
+    FOR ALL USING (is_super_admin());
+
+-- 급여 관리 테이블들 (민감 정보 포함)
+CREATE POLICY super_admin_bypass_monthly_payroll ON monthly_payroll
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_worker_payroll_details ON worker_payroll_details
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_income_tax_withholding ON income_tax_withholding
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_payroll_item_types ON payroll_item_types
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_company_payroll_items ON company_payroll_items
+    FOR ALL USING (is_super_admin());
+
+-- 근태 관리 테이블들
+CREATE POLICY super_admin_bypass_attendance_records ON attendance_records
+    FOR ALL USING (is_super_admin());
+
+-- 4대보험 관리 테이블들
+CREATE POLICY super_admin_bypass_insurance_acquisitions_losses ON insurance_acquisitions_losses
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_insurance_eligibility_records ON insurance_eligibility_records
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_current_insurance_status ON current_insurance_status
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_daily_worker_continuous_periods ON daily_worker_continuous_periods
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_worker_voluntary_insurance ON worker_voluntary_insurance
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_insurance_rates ON insurance_rates
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_employment_types ON employment_types
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_insurance_eligibility_criteria ON insurance_eligibility_criteria
+    FOR ALL USING (is_super_admin());
+
+-- 담당 관리 테이블들
+CREATE POLICY super_admin_bypass_user_company_assignments ON user_company_assignments
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_user_department_assignments ON user_department_assignments
+    FOR ALL USING (is_super_admin());
+
+-- 서비스 관리 테이블들
+CREATE POLICY super_admin_bypass_client_services ON client_services
+    FOR ALL USING (is_super_admin());
+
+CREATE POLICY super_admin_bypass_report_schedules ON report_schedules
+    FOR ALL USING (is_super_admin());
+
+-- 시스템 관리 테이블들
+CREATE POLICY super_admin_bypass_batch_processing_logs ON batch_processing_logs
+    FOR ALL USING (is_super_admin());
+
+-- 비과세 한도 관리 테이블들
+CREATE POLICY super_admin_bypass_nontax_limits ON nontax_limits
+    FOR ALL USING (is_super_admin());
+
+-- 기타 시스템 테이블들 (있다면 추가)
+-- CREATE POLICY super_admin_bypass_system_settings ON system_settings
+--     FOR ALL USING (is_super_admin());
+
+-- ===============================
+-- 4. SUPER_ADMIN 사용자 생성 헬퍼 함수
+-- ===============================
+
+-- SUPER_ADMIN 사용자 생성 함수 (개발/운영 환경 설정용)
+CREATE OR REPLACE FUNCTION create_super_admin_user(
+    p_username TEXT,
+    p_email TEXT,
+    p_password_hash TEXT,
+    p_name TEXT
+)
+RETURNS INTEGER AS $$
+DECLARE
+    v_user_id INTEGER;
+    v_role_id INTEGER;
+BEGIN
+    -- 사용자 생성
+    INSERT INTO users (username, email, password_hash, name, is_active, is_email_verified)
+    VALUES (p_username, p_email, p_password_hash, p_name, TRUE, TRUE)
+    RETURNING user_id INTO v_user_id;
+    
+    -- SUPER_ADMIN 역할 ID 조회
+    SELECT role_id INTO v_role_id 
+    FROM roles 
+    WHERE role_code = 'SUPER_ADMIN';
+    
+    -- 역할 배정
+    INSERT INTO user_roles (user_id, role_id, scope_type, is_active, start_date)
+    VALUES (v_user_id, v_role_id, 'global', TRUE, CURRENT_DATE);
+    
+    RETURN v_user_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ===============================
+-- 5. SUPER_ADMIN 권한 확인 함수들
+-- ===============================
+
+-- 현재 사용자가 SUPER_ADMIN인지 확인
+CREATE OR REPLACE FUNCTION current_user_is_super_admin()
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN is_super_admin();
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 특정 사용자가 SUPER_ADMIN인지 확인
+CREATE OR REPLACE FUNCTION check_user_is_super_admin(user_id_param INTEGER)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 
+        FROM user_roles ur
+        JOIN roles r ON ur.role_id = r.role_id
+        WHERE ur.user_id = user_id_param
+          AND r.role_code = 'SUPER_ADMIN'
+          AND ur.is_active = true
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ===============================
+-- 6. SUPER_ADMIN 관리 유틸리티 함수들
+-- ===============================
+
+-- 모든 사용자 권한 조회 (SUPER_ADMIN 전용)
+CREATE OR REPLACE FUNCTION get_all_user_permissions()
+RETURNS TABLE (
+    user_id INTEGER,
+    username TEXT,
+    name TEXT,
+    roles TEXT[],
+    is_super_admin BOOLEAN,
+    labor_office_id INTEGER,
+    accessible_companies INTEGER[]
+) AS $$
+BEGIN
+    -- SUPER_ADMIN만 접근 가능
+    IF NOT is_super_admin() THEN
+        RAISE EXCEPTION 'Access denied. SUPER_ADMIN privileges required.';
+    END IF;
+    
+    RETURN QUERY
+    SELECT 
+        u.user_id,
+        u.username,
+        u.name,
+        ARRAY(
+            SELECT r.role_code 
+            FROM user_roles ur 
+            JOIN roles r ON ur.role_id = r.role_id 
+            WHERE ur.user_id = u.user_id 
+              AND ur.is_active = true
+        ) as roles,
+        check_user_is_super_admin(u.user_id) as is_super_admin,
+        los.labor_office_id,
+        ARRAY(
+            SELECT uca.company_id 
+            FROM user_company_assignments uca 
+            WHERE uca.user_id = u.user_id 
+              AND uca.is_active = true
+        ) as accessible_companies
+    FROM users u
+    LEFT JOIN labor_office_staff los ON u.user_id = los.user_id AND los.employment_status = 'active'
+    ORDER BY u.user_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- RLS 정책 현황 조회 (SUPER_ADMIN 전용)
+CREATE OR REPLACE FUNCTION get_rls_policy_status()
+RETURNS TABLE (
+    table_name TEXT,
+    row_security_enabled BOOLEAN,
+    policy_count BIGINT,
+    has_super_admin_bypass BOOLEAN
+) AS $$
+BEGIN
+    -- SUPER_ADMIN만 접근 가능
+    IF NOT is_super_admin() THEN
+        RAISE EXCEPTION 'Access denied. SUPER_ADMIN privileges required.';
+    END IF;
+    
+    RETURN QUERY
+    SELECT 
+        t.tablename::TEXT,
+        t.rowsecurity as row_security_enabled,
+        COALESCE(p.policy_count, 0) as policy_count,
+        COALESCE(p.has_super_admin_bypass, FALSE) as has_super_admin_bypass
+    FROM pg_tables t
+    LEFT JOIN (
+        SELECT 
+            tablename,
+            COUNT(*) as policy_count,
+            BOOL_OR(policyname LIKE '%super_admin%') as has_super_admin_bypass
+        FROM pg_policies 
+        WHERE schemaname = 'public'
+        GROUP BY tablename
+    ) p ON t.tablename = p.tablename
+    WHERE t.schemaname = 'public'
+    ORDER BY t.tablename;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ===============================
+-- 7. 개발용 SUPER_ADMIN 계정 생성 (선택적)
+-- ===============================
+
+-- 개발 환경용 기본 SUPER_ADMIN 계정 생성 (운영환경에서는 주석 처리 권장)
+-- DO $$
+-- DECLARE
+--     v_admin_user_id INTEGER;
+-- BEGIN
+--     -- 이미 존재하는지 확인
+--     IF NOT EXISTS (SELECT 1 FROM users WHERE username = 'super_admin') THEN
+--         -- SUPER_ADMIN 계정 생성
+--         SELECT create_super_admin_user(
+--             'super_admin',
+--             'admin@system.local',
+--             '$2b$12$LQv3c1yqBwEHxE95rBNe4eO4otdu.xvyCQ6Lpf2aE6lF4Nv2UvTCW', -- 'password123'
+--             'System Administrator'
+--         ) INTO v_admin_user_id;
+--         
+--         RAISE NOTICE 'SUPER_ADMIN user created with ID: %', v_admin_user_id;
+--     ELSE
+--         RAISE NOTICE 'SUPER_ADMIN user already exists';
+--     END IF;
+-- END $$;
+
+-- ===============================
+-- 8. 사용 방법 및 보안 가이드
+-- ===============================
+
+/*
+===============================
+SUPER_ADMIN 사용 가이드
+===============================
+
+1. 계정 생성:
+   SELECT create_super_admin_user(
+       'admin_username',
+       'admin@company.com', 
+       '$2b$12$...', -- 해시된 비밀번호
+       'Administrator Name'
+   );
+
+2. 로그인 후 사용:
+   SELECT set_current_user_context(super_admin_user_id);
+   
+3. 권한 확인:
+   SELECT current_user_is_super_admin(); -- TRUE 반환되어야 함
+   
+4. 전체 시스템 조회:
+   SELECT * FROM get_all_user_permissions(); -- 모든 사용자 권한 조회
+   SELECT * FROM get_rls_policy_status(); -- RLS 정책 현황 조회
+
+5. 데이터 접근:
+   -- 모든 테이블의 모든 데이터에 제한 없이 접근 가능
+   SELECT * FROM monthly_payroll; -- 모든 회사의 모든 급여 데이터
+   SELECT * FROM workers; -- 모든 회사의 모든 근로자 데이터
+
+===============================
+보안 주의사항
+===============================
+
+1. 운영환경 보안:
+   - SUPER_ADMIN 계정은 최소한으로 생성
+   - 강력한 비밀번호와 2FA 적용 필수
+   - 접근 로그 모니터링 필수
+
+2. 개발환경 분리:
+   - 운영 데이터에는 개발용 SUPER_ADMIN 사용 금지
+   - 개발/테스트 환경에서만 사용
+
+3. 감사 추적:
+   - SUPER_ADMIN 사용 시 모든 활동 로깅
+   - 정기적인 권한 검토 및 갱신
+
+4. 응급 상황 대응:
+   - RLS 문제 해결용
+   - 데이터 복구 및 마이그레이션용
+   - 시스템 장애 대응용
+*/
+
+-- 함수들에 대한 설명 추가
+COMMENT ON FUNCTION is_super_admin() IS 'SUPER_ADMIN 권한 확인 (모든 데이터 접근 가능)';
+COMMENT ON FUNCTION create_super_admin_user(TEXT, TEXT, TEXT, TEXT) IS 'SUPER_ADMIN 사용자 생성 (개발/운영 환경 설정용)';
+COMMENT ON FUNCTION get_all_user_permissions() IS '모든 사용자 권한 조회 (SUPER_ADMIN 전용)';
+COMMENT ON FUNCTION get_rls_policy_status() IS 'RLS 정책 현황 조회 (SUPER_ADMIN 전용)';
+
+
+
+
+
+
+
+/*
+===============================
+RLS 정책 요약
+===============================
+
+1. 기본 원칙:
+   - 노무사 사무실 직원: 담당 회사들의 데이터만 접근
+   - 회사 직원: 자신의 회사 데이터만 접근
+   - 급여 정보: 가장 엄격한 제한 (관리자급만 접근)
+
+2. 역할별 권한:
+   - LABOR_ADMIN: 담당 회사 모든 데이터 읽기/쓰기
+   - LABOR_STAFF: 담당 회사 업무 데이터 읽기/쓰기 (급여는 읽기만)
+   - COMPANY_ADMIN: 자신의 회사 모든 데이터 읽기/쓰기
+   - COMPANY_HR: 자신의 회사 인사 데이터 읽기/쓰기 (본인 급여만)
+
+3. 민감 정보 보호:
+   - 급여 정보: 관리자급만 접근 가능
+   - 개인정보: 업무 필요 범위 내에서만 접근
+   - 4대보험 정보: 담당자만 접근 가능
+
+4. 사용 방법:
+   애플리케이션에서 사용자 로그인 후:
+   SELECT set_current_user_context(사용자ID);
+*/
